@@ -66,7 +66,9 @@ FILE *dbg_file=NULL;
 #endif
 volatile int tcp_socket=-1;
 volatile int udp_socket=-1;
+volatile int quit_program = 0;
 sigset_t sigs_msk;
+static int sig = 0;
 char *conf_file=CONFDIR"/pdnsd.conf";
 
 
@@ -213,13 +215,19 @@ static int check_ipv6()
 }
 #endif
 
+void sighandler(int signum)
+{
+	quit_program = 1;
+	sig = signum;
+}
+
 
 /*
  * Argument parsing, init, server startup
  */
 int main(int argc,char *argv[])
 {
-	int i,sig,pfd=-1;  /* Initialized to inhibit compiler warning */
+	int i,pfd=-1;  /* Initialized to inhibit compiler warning */
 
 	main_thrid=pthread_self();
 	servstat_thrid=main_thrid;
@@ -623,7 +631,7 @@ int main(int argc,char *argv[])
 		sigaddset(&sigs_msk,SIGQUIT);
 	} */
 #if (TARGET==TARGET_LINUX)
-	pthread_sigmask(SIG_BLOCK,&sigs_msk,NULL);
+	//pthread_sigmask(SIG_BLOCK,&sigs_msk,NULL);
 #endif
 
 #if DEBUG>0
@@ -637,6 +645,8 @@ int main(int argc,char *argv[])
 	}
 #endif
 
+	signal(SIGINT, sighandler);
+
 	{
 #if DEBUG>0
 		int thrdsucc=1;
@@ -647,13 +657,13 @@ int main(int argc,char *argv[])
 
 		if(start_servstat_thread()) thrdfail;
 
-#if (TARGET==TARGET_LINUX)
+//#if (TARGET==TARGET_LINUX)
 		if (!global.strict_suid) {
 			if (!run_as(global.run_as)) {
 				_exit(1);
 			}
 		}
-#endif
+//#endif
 
 		if (stat_pipe)
 			if(start_stat_sock()) thrdfail;
@@ -669,19 +679,10 @@ int main(int argc,char *argv[])
 	}
 
 #if (TARGET==TARGET_LINUX) && !defined(THREADLIB_NPTL)
-	pthread_sigmask(SIG_BLOCK,&sigs_msk,NULL);
+	//pthread_sigmask(SIG_BLOCK,&sigs_msk,NULL);
 	waiting=1;
 #endif
-	{
-		int err;
-		while ((err=sigwait(&sigs_msk,&sig))) {
-			if (err!=EINTR) {
-				log_error("sigwait failed: %s",strerror(err));
-				sig=0;
-				break;
-			}
-		}
-	}
+
 	if(sig) DEBUG_MSG("Signal %i caught.\n",sig);
 	write_disk_cache();
 	destroy_cache();

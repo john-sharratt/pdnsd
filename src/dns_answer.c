@@ -1635,24 +1635,24 @@ void *udp_server_thread(void *dummy)
 #endif
 	/* (void)dummy; */ /* To inhibit "unused variable" warning */
 
-	THREAD_SIGINIT;
+	/*THREAD_SIGINIT;
 
 
 	if (!global.strict_suid) {
 		if (!run_as(global.run_as)) {
 			pdnsd_exit();
 		}
-	}
+	}*/
 
 	sock=udp_socket;
 
-	while (1) {
+	/*while (1)*/ {
 		int udpbufsize= global.udpbufsize;
 		if (!(buf=(udp_buf_t *)pdnsd_calloc(1,sizeof(udp_buf_t)+udpbufsize))) {
 			if (++da_mem_errs<=MEM_MAX_ERRS) {
 				log_error("Out of memory in request handling.");
 			}
-			break;
+			exit(-1);
 		}
 
 		buf->sock=sock;
@@ -1773,7 +1773,7 @@ void *udp_server_thread(void *dummy)
 				buf->len=qlen;
 				err=pthread_create(&pt,&attr_detached,udp_answer_thread,(void *)buf);
 				if(err==0)
-					continue;
+					return NULL; // ok
 				if(++da_thrd_errs<=THRD_MAX_ERRS)
 					log_warn("pthread_create failed: %s",strerror(err));
 				/* If thread creation failed, free resources associated with it. */
@@ -1785,14 +1785,14 @@ void *udp_server_thread(void *dummy)
 		}
 	free_buf_continue:
 		pdnsd_free(buf);
-		usleep_r(50000);
+		//usleep_r(50000);
 	}
 
-	udp_socket=-1;
+	/*udp_socket=-1;
 	close(sock);
 	udps_thrid=main_thrid;
 	if (tcp_socket==-1)
-	  pdnsd_exit();
+	  pdnsd_exit();*/
 	return NULL;
 }
 
@@ -2024,6 +2024,12 @@ int init_tcp_socket()
 		close(sock);
 		return -1;
 	}
+
+	if (listen(sock, 5)) {
+		log_error("Could not listen on tcp socket: %s",strerror(errno));
+		close(sock);
+		return -1;
+	}
 	return sock;
 }
 
@@ -2038,29 +2044,22 @@ void *tcp_server_thread(void *p)
 
 	/* (void)p; */  /* To inhibit "unused variable" warning */
 
-	THREAD_SIGINIT;
+	/*THREAD_SIGINIT;
 
 	if (!global.strict_suid) {
 		if (!run_as(global.run_as)) {
 			pdnsd_exit();
 		}
-	}
+	}*/
 
 	sock=tcp_socket;
 
-	if (listen(sock,5)) {
-		if (++da_tcp_errs<=TCP_MAX_ERRS) {
-			log_error("Could not listen on tcp socket: %s",strerror(errno));
-		}
-		goto close_sock_return;
-	}
-
-	while (1) {
+	/*while (1)*/ {
 		if (!(csock=(int *)pdnsd_malloc(sizeof(int)))) {
 			if (++da_mem_errs<=MEM_MAX_ERRS) {
 				log_error("Out of memory in request handling.");
 			}
-			break;
+			exit(-1);
 		}
 		if ((*csock=accept(sock,NULL,0))==-1) {
 			if (errno!=EINTR && ++da_tcp_errs<=TCP_MAX_ERRS) {
@@ -2078,7 +2077,7 @@ void *tcp_server_thread(void *p)
 				pthread_mutex_unlock(&proc_lock);
 				err=pthread_create(&pt,&attr_detached,tcp_answer_thread,(void *)csock);
 				if(err==0)
-					continue;
+					return NULL; // ok
 				if(++da_thrd_errs<=THRD_MAX_ERRS)
 					log_warn("pthread_create failed: %s",strerror(err));
 				/* If thread creation failed, free resources associated with it. */
@@ -2087,17 +2086,17 @@ void *tcp_server_thread(void *p)
 			}
 			++dropped;
 			pthread_mutex_unlock(&proc_lock);
-			close(*csock);
+			close(*csock); // free when fail
 		}
 		pdnsd_free(csock);
-		usleep_r(50000);
+		//usleep_r(50000);
 	}
- close_sock_return:
+/* close_sock_return:
 	tcp_socket=-1;
 	close(sock);
 	tcps_thrid=main_thrid;
 	if (udp_socket==-1)
-		pdnsd_exit();
+		pdnsd_exit();*/
 	return NULL;
 }
 #endif
@@ -2108,32 +2107,52 @@ void *tcp_server_thread(void *p)
  */
 void start_dns_servers()
 {
+	while (!quit_program) {
+		fd_set rfds;
+		struct timeval tv;
+		int retval, maxfd = 0;
+
+		/* Watch stdin (fd 0) to see when it has input. */
+		FD_ZERO(&rfds);
+#ifndef NO_TCP_SERVER
+		if (tcp_socket != -1) {
+			FD_SET(tcp_socket, &rfds);
+			maxfd = MAX(maxfd, tcp_socket);
+		}
+#endif
+		if (udp_socket != -1) {
+			FD_SET(udp_socket, &rfds);
+			maxfd = MAX(maxfd, udp_socket);
+		}
+
+		/* Wait up to five seconds. */
+		tv.tv_sec = 5;
+		tv.tv_usec = 0;
+
+		retval = select(maxfd + 1, &rfds, NULL, NULL, &tv);
+		/* Don’t rely on the value of tv now! */
+
+		if (retval == -1) {
+			if (errno == EINTR)
+				continue;
+			perror("select()");
+			break;
+		}
+		else if (retval == 0) {
+			continue; /* timeout */
+		}
 
 #ifndef NO_TCP_SERVER
-	if (tcp_socket!=-1) {
-		pthread_t tcps;
-
-		if (pthread_create(&tcps,&attr_detached,tcp_server_thread,NULL)) {
-			log_error("Could not create TCP server thread. Exiting.");
-			pdnsd_exit();
-		} else {
-			tcps_thrid=tcps;
-			log_info(2,"TCP server thread started.");
+		if (tcp_socket != -1 && FD_ISSET(tcp_socket, &rfds)) {
+			tcp_server_thread(NULL);
 		}
-	}
 #endif
-
-	if (udp_socket!=-1) {
-		pthread_t udps;
-
-		if (pthread_create(&udps,&attr_detached,udp_server_thread,NULL)) {
-			log_error("Could not create UDP server thread. Exiting.");
-			pdnsd_exit();
-		} else {
-			udps_thrid=udps;
-			log_info(2,"UDP server thread started.");
+		if (udp_socket != -1 && FD_ISSET(udp_socket, &rfds)) {
+			udp_server_thread(NULL);
 		}
+
 	}
+
 }
 
 

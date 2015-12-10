@@ -30,6 +30,7 @@
 extern pthread_t main_thrid,servstat_thrid,statsock_thrid,tcps_thrid,udps_thrid;
 extern volatile int tcp_socket;
 extern volatile int udp_socket;
+extern volatile int quit_program;
 /* --- */
 
 int init_udp_socket(void);
