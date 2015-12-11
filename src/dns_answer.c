@@ -58,6 +58,7 @@
 #include "cache.h"
 #include "error.h"
 #include "debug.h"
+#include <assert.h>
 
 
 /*
@@ -82,10 +83,6 @@ static volatile int qprocs=0;  /* queued query processes */
 static volatile unsigned long dropped=0,spawned=0;
 static volatile unsigned thrid_cnt=0;
 static pthread_mutex_t proc_lock = PTHREAD_MUTEX_INITIALIZER;
-
-#ifdef SOCKET_LOCKING
-static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
-#endif
 
 typedef union {
 #ifdef ENABLE_IPV4
@@ -1359,70 +1356,93 @@ static void udp_answer_thread_cleanup(void *data)
 	decrease_procs();
 }
 
+#define EVENT_READ 1
+#define EVENT_WRITE 2
+#define EVENT_PENDING 4
+
+#define NEED_WAIT 100
+#define STATE_FINISH -1
+
+#define yield(s, event, ret) do { \
+    s->events = event; \
+    s->state = __LINE__; \
+    return ret; case __LINE__:; \
+} while(0)
+
+#define SAFE_FREE(p) do { \
+    if (p) { \
+        pdnsd_free(p); \
+        p = NULL; \
+    } \
+} while(0)
+
+
+struct udp_answer_task {
+	int state;
+	int events;
+
+	int rcode;
+	udp_buf_t *data;
+	size_t rlen;
+	/* XXX: process_query is assigned to this, this mallocs, so this points to aligned memory */
+	dns_msg_t *resp;
+	
+} *udp_answer_task_array = NULL;
+
 /*
  * A thread opened to answer a query transmitted via udp. Data is a pointer to the structure udp_buf_t that
  * contains the received data and various other parameters.
  * After the query is answered, the thread terminates
  * XXX: data must point to a correctly aligned buffer
  */
-static void *udp_answer_thread(void *data)
+static int udp_answer_thread(struct udp_answer_task *task)
 {
-	struct msghdr msg;
-	struct iovec v;
-	struct cmsghdr *cmsg;
-#if defined(SRC_ADDR_DISC)
-	char ctrl[CMSG_SPACE(sizeof(pkt_info_t))];
-#endif
-	size_t rlen=((udp_buf_t *)data)->len;
 	unsigned udpmaxrespsize = UDP_BUFSIZE;
-	/* XXX: process_query is assigned to this, this mallocs, so this points to aligned memory */
-	dns_msg_t *resp;
-	int rcode;
 	unsigned thrid;
-	pthread_cleanup_push(udp_answer_thread_cleanup, data);
-	THREAD_SIGINIT;
 
-	if (!global.strict_suid) {
-		if (!run_as(global.run_as)) {
-			pdnsd_exit();
-		}
-	}
+#define rcode (task->rcode)
+#define data (task->data)
+#define rlen (task->rlen)
+#define resp (task->resp)
+
+	assert(task->state >= 0);
+	switch (task->state) { /* reenter coroutine */
+		case 0:
 
 	for(;;) {
 		pthread_mutex_lock(&proc_lock);
 		if (procs<global.proc_limit)
 			break;
 		pthread_mutex_unlock(&proc_lock);
-		usleep_r(50000);
+		assert(0);
 	}
 	++procs;
 	thrid= ++thrid_cnt;
 	pthread_mutex_unlock(&proc_lock);
 
-#if DEBUG>0
-	if(debug_p) {
-		int err;
-		if ((err=pthread_setspecific(thrid_key, &thrid)) != 0) {
-			if(++da_misc_errs<=MISC_MAX_ERRS)
-				log_error("pthread_setspecific failed: %s",strerror(err));
-			/* pdnsd_exit(); */
-		}
-	}
-#endif
-
-	if (!(resp=process_query(((udp_buf_t *)data)->buf,&rlen,&udpmaxrespsize,&rcode))) {
+	rlen = data->len;
+	if (!(resp=process_query(((udp_buf_t *)data)->buf, &rlen, &udpmaxrespsize, &rcode))) {
 		/*
 		 * A return value of NULL is a fatal error that prohibits even the sending of an error message.
 		 * logging is already done. Just exit the thread now.
 		 */
-		pthread_exit(NULL); /* data freed by cleanup handler */
+		goto fail; /* data freed by cleanup handler */
 	}
-	pthread_cleanup_push(free, resp);
+	//pthread_cleanup_push(free, resp);
 	if (rlen>udpmaxrespsize) {
 		rlen=udpmaxrespsize;
 		resp->hdr.tc=1; /*set truncated bit*/
 	}
 	DEBUG_MSG("Outbound msg len %li, tc=%u, rc=\"%s\"\n",(long)rlen,resp->hdr.tc,get_ename(rcode));
+
+	yield(task, EVENT_WRITE, NEED_WAIT);
+	{
+	struct msghdr msg;
+	struct iovec v;
+	struct cmsghdr *cmsg;
+#if defined(SRC_ADDR_DISC)
+	char ctrl[CMSG_SPACE(sizeof(pkt_info_t))] = {0};
+#endif
 
 	v.iov_base=(char *)&resp->hdr;
 	v.iov_len=rlen;
@@ -1508,14 +1528,7 @@ static void *udp_answer_thread(void *data)
 	}
 #endif
 
-	/* Lock the socket, and clear the error flag before dropping the lock */
-#ifdef SOCKET_LOCKING
-	pthread_mutex_lock(&s_lock);
-#endif
-	if (sendmsg(((udp_buf_t *)data)->sock,&msg,0)<0) {
-#ifdef SOCKET_LOCKING
-		pthread_mutex_unlock(&s_lock);
-#endif
+	if (sendmsg(((udp_buf_t *)data)->sock, &msg, 0) < 0) {
 		if (++da_udp_errs<=UDP_MAX_ERRS) {
 			log_error("Error in udp send: %s",strerror(errno));
 		}
@@ -1523,14 +1536,45 @@ static void *udp_answer_thread(void *data)
 		int tmp;
 		socklen_t sl=sizeof(tmp);
 		getsockopt(((udp_buf_t *)data)->sock, SOL_SOCKET, SO_ERROR, &tmp, &sl);
-#ifdef SOCKET_LOCKING
-		pthread_mutex_unlock(&s_lock);
-#endif
+	}
 	}
 
-	pthread_cleanup_pop(1);  /* free(resp) */
-	pthread_cleanup_pop(1);  /* free(data) */
-	return NULL;
+	} /* end coroutine */
+
+fail:
+	SAFE_FREE(resp);
+	udp_answer_thread_cleanup(data);
+
+	data = NULL;
+	task->events = 0;
+	task->state = STATE_FINISH;
+
+#undef rcode
+#undef data
+#undef rlen
+#undef resp
+	return 0;
+}
+
+static void create_udp_answer_thread(udp_buf_t *data) 
+{
+	int i;
+    /* find a free space */
+    for (i = 0; i < global.proc_limit; ++i) {
+        if (udp_answer_task_array[i].events == 0) {
+            memset(udp_answer_task_array + i, 0, sizeof udp_answer_task_array[i]);
+            //udp_answer_task_array[i].fd = sock;
+            udp_answer_task_array[i].events = 0;
+            udp_answer_task_array[i].data = data;
+
+            udp_answer_thread(udp_answer_task_array + i);
+            return;
+        }
+    }
+
+    log_error("Cannot find free task for UDP.\n");
+    exit(-1);
+	
 }
 
 int init_udp_socket()
@@ -1771,9 +1815,14 @@ void *udp_server_thread(void *dummy)
 				++qprocs; ++spawned;
 				pthread_mutex_unlock(&proc_lock);
 				buf->len=qlen;
+#if 0
 				err=pthread_create(&pt,&attr_detached,udp_answer_thread,(void *)buf);
 				if(err==0)
 					return NULL; // ok
+#else
+				create_udp_answer_thread(buf);
+				return;
+#endif
 				if(++da_thrd_errs<=THRD_MAX_ERRS)
 					log_warn("pthread_create failed: %s",strerror(err));
 				/* If thread creation failed, free resources associated with it. */
@@ -1801,49 +1850,56 @@ void *udp_server_thread(void *dummy)
 static void tcp_answer_thread_cleanup(void *csock)
 {
 	close(*((int *)csock));
-	pdnsd_free(csock);
+	//pdnsd_free(csock);
 	decrease_procs();
 }
+
+struct tcp_answer_task
+{
+    int fd;
+    int events; // read write
+    int state;
+    int time; // TODO: timeout
+
+		int rlen,olen;
+		size_t nlen;
+		unsigned char *buf;
+		dns_msg_t *resp;
+        size_t rsize;
+} *tcp_answer_task_array = NULL;
 
 /*
  * Process a dns query via tcp. The argument is a pointer to the socket.
  */
-static void *tcp_answer_thread(void *csock)
+static void *tcp_answer_thread(struct tcp_answer_task *task)
 {
 	/* XXX: This should be OK, the original must be (and is) aligned */
-	int sock=*((int *)csock);
+	int sock = task->fd;
 	unsigned thrid;
+    ssize_t rc;
 
-	pthread_cleanup_push(tcp_answer_thread_cleanup, csock);
-	THREAD_SIGINIT;
+#define rlen (task->rlen)
+#define olen (task->olen)
+#define nlen (task->nlen)
+#define buf (task->buf)
+#define resp (task->resp)
+#define rsize (task->rsize)
 
-	if (!global.strict_suid) {
-		if (!run_as(global.run_as)) {
-			pdnsd_exit();
-		}
-	}
+	assert(task->state >= 0);
+    switch (task->state) { /* reenter coroutine */
+        case 0:
 
 	for(;;) {
 		pthread_mutex_lock(&proc_lock);
 		if (procs<global.proc_limit)
 			break;
 		pthread_mutex_unlock(&proc_lock);
-		usleep_r(50000);
+		assert(0);
 	}
 	++procs;
 	thrid= ++thrid_cnt;
 	pthread_mutex_unlock(&proc_lock);
 
-#if DEBUG>0
-	if(debug_p) {
-		int err;
-		if ((err=pthread_setspecific(thrid_key, &thrid)) != 0) {
-			if(++da_misc_errs<=MISC_MAX_ERRS)
-				log_error("pthread_setspecific failed: %s",strerror(err));
-			/* pdnsd_exit(); */
-		}
-	}
-#endif
 #ifdef TCP_SUBSEQ
 
 	/* rfc1035 says we should process multiple queries in succession, so we are looping until
@@ -1853,89 +1909,56 @@ static void *tcp_answer_thread(void *csock)
 	for(;;)
 #endif
 	{
-		int rlen,olen;
-		size_t nlen;
-		unsigned char *buf;
-		dns_msg_t *resp;
-
-#ifdef NO_POLL
-		fd_set fds;
-		struct timeval tv;
-		FD_ZERO(&fds);
-		PDNSD_ASSERT(sock<FD_SETSIZE,"socket file descriptor exceeds FD_SETSIZE.");
-		FD_SET(sock, &fds);
-		tv.tv_usec=0;
-		tv.tv_sec=global.tcp_qtimeout;
-		if (select(sock+1,&fds,NULL,NULL,&tv)<=0)
-			pthread_exit(NULL); /* socket is closed by cleanup handler */
-#else
-		struct pollfd pfd;
-		pfd.fd=sock;
-		pfd.events=POLLIN;
-		if (poll(&pfd,1,global.tcp_qtimeout*1000)<=0)
-			pthread_exit(NULL); /* socket is closed by cleanup handler */
-#endif
+        yield(task, EVENT_READ, );
 		{
-			ssize_t err;
 			uint16_t rlen_net;
-			if ((err=read(sock,&rlen_net,sizeof(rlen_net)))!=sizeof(rlen_net)) {
-				DEBUG_MSG("Error while reading from TCP client: %s\n",err==-1?strerror(errno):"incomplete data");
+			if ((rc = read(sock, &rlen_net, sizeof(rlen_net))) != sizeof(rlen_net)) {
+				DEBUG_MSG("Error while reading from TCP client: %s\n",rc==-1?strerror(errno):"incomplete data");
 				/*
 				 * If the socket timed or was closed before we even received the
 				 * query length, we cannot return an error. So exit silently.
 				 */
-				pthread_exit(NULL); /* socket is closed by cleanup handler */
+				goto fail; /* socket is closed by cleanup handler */
 			}
 			rlen=ntohs(rlen_net);
 		}
 		if (rlen == 0) {
 			log_error("TCP zero size query received.\n");
-			pthread_exit(NULL);
+			goto fail;
 		}
 		buf=(unsigned char *)pdnsd_malloc(rlen);
 		if (!buf) {
 			if (++da_mem_errs<=MEM_MAX_ERRS) {
 				log_error("Out of memory in request handling.");
 			}
-			pthread_exit(NULL); /* socket is closed by cleanup handler */
+			goto fail; /* socket is closed by cleanup handler */
 		}
-		pthread_cleanup_push(free, buf);
+		//pthread_cleanup_push(free, buf);
 
-		olen=0;
-		while(olen<rlen) {
-			int rv;
-#ifdef NO_POLL
-			FD_ZERO(&fds);
-			FD_SET(sock, &fds);
-			tv.tv_usec=0;
-			tv.tv_sec=global.tcp_qtimeout;
-			if (select(sock+1,&fds,NULL,NULL,&tv)<=0)
-				pthread_exit(NULL);  /* buf freed and socket closed by cleanup handlers */
-#else
-			pfd.fd=sock;
-			pfd.events=POLLIN;
-			if (poll(&pfd,1,global.tcp_qtimeout*1000)<=0)
-				pthread_exit(NULL);  /* buf freed and socket closed by cleanup handlers */
-#endif
-			rv=read(sock,buf+olen,rlen-olen);
-			if (rv<=0) {
-				DEBUG_MSG("Error while reading from TCP client: %s\n",rv==-1?strerror(errno):"incomplete data");
-				/*
-				 * If the promised length was not sent, we should return an error message,
-				 * but if read fails that way, it is unlikely that it will arrive. Nevertheless...
-				 */
-				if (olen>=2) { /* We need the id to send a valid reply. */
-					dns_msg_t err;
-					mk_error_reply(((dns_hdr_t*)buf)->id,
-						       olen>=3?((dns_hdr_t*)buf)->opcode:OP_QUERY,
-						       RC_FORMAT,
-						       &err.hdr);
-					err.len=htons(sizeof(dns_hdr_t));
-					write_all(sock,&err,sizeof(err)); /* error anyway. */
-				}
-				pthread_exit(NULL); /* buf freed and socket closed by cleanup handlers */
-			}
-			olen += rv;
+		olen = 0;
+		while (olen < rlen) {
+            yield(task, EVENT_READ, );
+            {
+                rc = read(sock, buf + olen, rlen - olen);
+                if (rc<=0) {
+                    DEBUG_MSG("Error while reading from TCP client: %s\n",rc==-1?strerror(errno):"incomplete data");
+                    /*
+                     * If the promised length was not sent, we should return an error message,
+                     * but if read fails that way, it is unlikely that it will arrive. Nevertheless...
+                     */
+                    if (olen>=2) { /* We need the id to send a valid reply. */
+                        dns_msg_t err_replay;
+                        mk_error_reply(((dns_hdr_t*)buf)->id,
+                                   olen>=3?((dns_hdr_t*)buf)->opcode:OP_QUERY,
+                                   RC_FORMAT,
+                                   &err_replay.hdr);
+                        err_replay.len=htons(sizeof(dns_hdr_t));
+                        write_all(sock,&err_replay,sizeof(err_replay)); /* error anyway. */
+                    }
+                    goto fail; /* buf freed and socket closed by cleanup handlers */
+                }
+                olen += rc;
+            }
 		}
 		nlen=rlen;
 		if (!(resp=process_query(buf,&nlen,NULL,NULL))) {
@@ -1943,26 +1966,68 @@ static void *tcp_answer_thread(void *csock)
 			 * A return value of NULL is a fatal error that prohibits even the sending of an error message.
 			 * logging is already done. Just exit the thread now.
 			 */
-			pthread_exit(NULL);
+			goto fail;
 		}
-		pthread_cleanup_pop(1);  /* free(buf) */
-		pthread_cleanup_push(free,resp);
-		{
-			int err; size_t rsize;
-			resp->len=htons(nlen);
-			rsize=dnsmsghdroffset+nlen;
-			if ((err=write_all(sock,resp,rsize))!=rsize) {
-				DEBUG_MSG("Error while writing to TCP client: %s\n",err==-1?strerror(errno):"unknown error");
-				pthread_exit(NULL); /* resp is freed and socket is closed by cleanup handlers */
-			}
-		}
-		pthread_cleanup_pop(1);  /* free(resp) */
-	}
 
-	/* socket is closed by cleanup handler */
-	pthread_cleanup_pop(1);
+		{
+			resp->len = htons(nlen);
+			rsize = dnsmsghdroffset + nlen;
+            olen = 0;
+            while(olen < rsize) {
+                yield(task, EVENT_WRITE, );
+                if ((rc = write(sock, (char*)resp + olen, rsize - olen)) == -1) {
+                    DEBUG_MSG("Error while writing to TCP client: %s\n", strerror(errno));
+                    goto fail; 
+                }
+                olen += rc;
+            }
+		}
+		//pthread_cleanup_pop(1);  /* free(resp) */
+done:
+        SAFE_FREE(buf);
+        SAFE_FREE(resp);
+	}
+    
+    } /* end coroutine */
+
+fail:
+    SAFE_FREE(buf);
+    SAFE_FREE(resp);
+
+    tcp_answer_thread_cleanup(&sock); /* close(fd), --proc */
+
+    task->events = 0;
+    task->fd = -1;
+    task->state = STATE_FINISH;
+
+#undef rlen
+#undef olen
+#undef nlen
+#undef buf
+#undef resp
+#undef rsize
 	return NULL;
 }
+
+static void *create_tcp_answer_thread(int sock)
+{
+	int i;
+    /* find a free space */
+    for (i = 0; i < global.proc_limit; ++i) {
+        if (tcp_answer_task_array[i].events == 0) {
+            memset(tcp_answer_task_array + i, 0, sizeof tcp_answer_task_array[i]);
+            tcp_answer_task_array[i].fd = sock;
+            tcp_answer_task_array[i].events = 0;
+
+            tcp_answer_thread(tcp_answer_task_array + i);
+            return;
+        }
+    }
+
+    log_error("Cannot find free task for TCP.\n");
+    exit(-1);
+}
+
 
 int init_tcp_socket()
 {
@@ -2030,6 +2095,10 @@ int init_tcp_socket()
 		close(sock);
 		return -1;
 	}
+
+    tcp_answer_task_array = pdnsd_calloc(1, sizeof(struct tcp_answer_task) * global.proc_limit);
+    udp_answer_task_array = pdnsd_calloc(1, sizeof(struct tcp_answer_task) * global.proc_limit);
+
 	return sock;
 }
 
@@ -2040,7 +2109,7 @@ void *tcp_server_thread(void *p)
 {
 	int sock;
 	pthread_t pt;
-	int *csock;
+	int csock;
 
 	/* (void)p; */  /* To inhibit "unused variable" warning */
 
@@ -2055,13 +2124,7 @@ void *tcp_server_thread(void *p)
 	sock=tcp_socket;
 
 	/*while (1)*/ {
-		if (!(csock=(int *)pdnsd_malloc(sizeof(int)))) {
-			if (++da_mem_errs<=MEM_MAX_ERRS) {
-				log_error("Out of memory in request handling.");
-			}
-			exit(-1);
-		}
-		if ((*csock=accept(sock,NULL,0))==-1) {
+		if ((csock=accept(sock,NULL,0))==-1) {
 			if (errno!=EINTR && ++da_tcp_errs<=TCP_MAX_ERRS) {
 				log_error("tcp accept failed: %s",strerror(errno));
 			}
@@ -2075,9 +2138,14 @@ void *tcp_server_thread(void *p)
 				int err;
 				++qprocs; ++spawned;
 				pthread_mutex_unlock(&proc_lock);
+#if 0
 				err=pthread_create(&pt,&attr_detached,tcp_answer_thread,(void *)csock);
 				if(err==0)
 					return NULL; // ok
+#else
+				create_tcp_answer_thread(csock);
+                return;
+#endif
 				if(++da_thrd_errs<=THRD_MAX_ERRS)
 					log_warn("pthread_create failed: %s",strerror(err));
 				/* If thread creation failed, free resources associated with it. */
@@ -2086,9 +2154,8 @@ void *tcp_server_thread(void *p)
 			}
 			++dropped;
 			pthread_mutex_unlock(&proc_lock);
-			close(*csock); // free when fail
+			close(csock); // free when fail
 		}
-		pdnsd_free(csock);
 		//usleep_r(50000);
 	}
 /* close_sock_return:
@@ -2107,21 +2174,42 @@ void *tcp_server_thread(void *p)
  */
 void start_dns_servers()
 {
+	int i;
+
 	while (!quit_program) {
-		fd_set rfds;
+		fd_set rfds, wfds;
 		struct timeval tv;
 		int retval, maxfd = 0;
 
 		/* Watch stdin (fd 0) to see when it has input. */
 		FD_ZERO(&rfds);
+		FD_ZERO(&wfds);
 #ifndef NO_TCP_SERVER
 		if (tcp_socket != -1) {
 			FD_SET(tcp_socket, &rfds);
 			maxfd = MAX(maxfd, tcp_socket);
 		}
+        for (i = 0; i < global.proc_limit; ++i) {
+            if (tcp_answer_task_array[i].events & EVENT_READ) {
+                FD_SET(tcp_answer_task_array[i].fd, &rfds);
+				maxfd = MAX(maxfd, tcp_answer_task_array[i].fd);
+            }
+            if (tcp_answer_task_array[i].events & EVENT_WRITE) {
+                FD_SET(tcp_answer_task_array[i].fd, &wfds);
+				maxfd = MAX(maxfd, tcp_answer_task_array[i].fd);
+            }
+        }
 #endif
 		if (udp_socket != -1) {
 			FD_SET(udp_socket, &rfds);
+
+			for (i = 0; i < global.proc_limit; ++i) {
+				if (udp_answer_task_array[i].events & EVENT_WRITE) {
+					FD_SET(udp_socket, &wfds);
+					break;
+				}
+			}
+
 			maxfd = MAX(maxfd, udp_socket);
 		}
 
@@ -2129,7 +2217,7 @@ void start_dns_servers()
 		tv.tv_sec = 5;
 		tv.tv_usec = 0;
 
-		retval = select(maxfd + 1, &rfds, NULL, NULL, &tv);
+		retval = select(maxfd + 1, &rfds, &wfds, NULL, &tv);
 		/* Don’t rely on the value of tv now! */
 
 		if (retval == -1) {
@@ -2146,9 +2234,27 @@ void start_dns_servers()
 		if (tcp_socket != -1 && FD_ISSET(tcp_socket, &rfds)) {
 			tcp_server_thread(NULL);
 		}
+        for (i = 0; i < global.proc_limit; ++i) {
+            if ((tcp_answer_task_array[i].events & EVENT_READ) &&
+                    FD_ISSET(tcp_answer_task_array[i].fd, &rfds)) {
+                tcp_answer_thread(tcp_answer_task_array + i);
+            }
+            if ((tcp_answer_task_array[i].events & EVENT_WRITE) &&
+                    FD_ISSET(tcp_answer_task_array[i].fd, &wfds)) {
+                tcp_answer_thread(tcp_answer_task_array + i);
+            }
+        }
 #endif
 		if (udp_socket != -1 && FD_ISSET(udp_socket, &rfds)) {
 			udp_server_thread(NULL);
+		}
+		if (udp_socket != -1 && FD_ISSET(udp_socket, &wfds)) {
+			for (i = 0; i < global.proc_limit; ++i) {
+				if (udp_answer_task_array[i].events & EVENT_WRITE) {
+					udp_answer_thread(udp_answer_task_array + i);
+					break;
+				}
+			}
 		}
 
 	}
