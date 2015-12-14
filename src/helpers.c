@@ -33,6 +33,7 @@
 #include <pwd.h>
 #include <grp.h>
 #include <errno.h>
+#include <fcntl.h>
 #include "ipvers.h"
 #include "thread.h"
 #include "error.h"
@@ -793,3 +794,12 @@ const char *inet_ntop(int af, const void *src, char *dst, size_t size)
 	return rc;
 }
 #endif
+
+int setnonblocking(int sockfd)
+{
+    if (fcntl(sockfd, F_SETFL, fcntl(sockfd, F_GETFD, 0)|O_NONBLOCK) == -1) {
+        return -1;
+    }
+    return 0;
+}
+

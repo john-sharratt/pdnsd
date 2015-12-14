@@ -1655,6 +1655,10 @@ int init_udp_socket()
 		close(sock);
 		return -1;
 	}
+	setnonblocking(sock);
+
+    udp_answer_task_array = pdnsd_calloc(1, sizeof(struct udp_answer_task) * global.proc_limit);
+
 	return sock;
 }
 
@@ -1810,7 +1814,7 @@ void *udp_server_thread(void *dummy)
 
 		if (qlen>=0) {
 			pthread_mutex_lock(&proc_lock);
-			if (qprocs<global.proc_limit+global.procq_limit) {
+			if (qprocs<global.proc_limit/*+global.procq_limit*/) {
 				int err;
 				++qprocs; ++spawned;
 				pthread_mutex_unlock(&proc_lock);
@@ -2096,8 +2100,9 @@ int init_tcp_socket()
 		return -1;
 	}
 
+	setnonblocking(sock);
+
     tcp_answer_task_array = pdnsd_calloc(1, sizeof(struct tcp_answer_task) * global.proc_limit);
-    udp_answer_task_array = pdnsd_calloc(1, sizeof(struct tcp_answer_task) * global.proc_limit);
 
 	return sock;
 }
@@ -2134,7 +2139,7 @@ void *tcp_server_thread(void *p)
 			 * in rfc1035 not to block
 			 */
 			pthread_mutex_lock(&proc_lock);
-			if (qprocs<global.proc_limit+global.procq_limit) {
+			if (qprocs<global.proc_limit/*+global.procq_limit*/) {
 				int err;
 				++qprocs; ++spawned;
 				pthread_mutex_unlock(&proc_lock);
@@ -2143,6 +2148,8 @@ void *tcp_server_thread(void *p)
 				if(err==0)
 					return NULL; // ok
 #else
+				/* Linux not inherit, differs from the canonical BSD sockets implementation */
+				setnonblocking(csock); 
 				create_tcp_answer_thread(csock);
                 return;
 #endif
