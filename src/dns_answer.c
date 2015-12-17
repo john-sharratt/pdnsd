@@ -1435,7 +1435,7 @@ static int udp_answer_thread(struct udp_answer_task *task)
 	}
 	DEBUG_MSG("Outbound msg len %li, tc=%u, rc=\"%s\"\n",(long)rlen,resp->hdr.tc,get_ename(rcode));
 
-	yield(task, EVENT_WRITE, NEED_WAIT);
+retry:
 	{
 	struct msghdr msg;
 	struct iovec v;
@@ -1529,7 +1529,11 @@ static int udp_answer_thread(struct udp_answer_task *task)
 #endif
 
 	if (sendmsg(((udp_buf_t *)data)->sock, &msg, 0) < 0) {
-		if (++da_udp_errs<=UDP_MAX_ERRS) {
+		if (errno == EAGAIN || errno == EWOULDBLOCK) {
+			yield(task, EVENT_WRITE, NEED_WAIT);
+			assert(0);
+			goto retry;
+		} else if (++da_udp_errs<=UDP_MAX_ERRS) {
 			log_error("Error in udp send: %s",strerror(errno));
 		}
 	} else {
@@ -1978,12 +1982,16 @@ static void *tcp_answer_thread(struct tcp_answer_task *task)
 			rsize = dnsmsghdroffset + nlen;
             olen = 0;
             while(olen < rsize) {
-                yield(task, EVENT_WRITE, );
                 if ((rc = write(sock, (char*)resp + olen, rsize - olen)) == -1) {
-                    DEBUG_MSG("Error while writing to TCP client: %s\n", strerror(errno));
-                    goto fail; 
-                }
-                olen += rc;
+					if (errno == EAGAIN || errno == EWOULDBLOCK) {
+						yield(task, EVENT_WRITE, );
+					} else {
+						DEBUG_MSG("Error while writing to TCP client: %s\n", strerror(errno));
+						goto fail; 
+					}
+				} else {
+					olen += rc;
+				}
             }
 		}
 		//pthread_cleanup_pop(1);  /* free(resp) */
@@ -2232,8 +2240,7 @@ void start_dns_servers()
 				continue;
 			perror("select()");
 			break;
-		}
-		else if (retval == 0) {
+		} else if (retval == 0) {
 			continue; /* timeout */
 		}
 
@@ -2258,8 +2265,8 @@ void start_dns_servers()
 		if (udp_socket != -1 && FD_ISSET(udp_socket, &wfds)) {
 			for (i = 0; i < global.proc_limit; ++i) {
 				if (udp_answer_task_array[i].events & EVENT_WRITE) {
-					udp_answer_thread(udp_answer_task_array + i);
-					break;
+					if (NEED_WAIT == udp_answer_thread(udp_answer_task_array + i))
+						break;
 				}
 			}
 		}
