@@ -45,6 +45,7 @@
 #include "netdev.h"
 #include "error.h"
 #include "debug.h"
+#include <assert.h>
 
 
 #if defined(NO_TCP_QUERIES) && M_PRESET!=UDP_ONLY
@@ -949,9 +950,9 @@ static int p_query_sm(query_stat_t *st)
 		st->state=QS_TCPREAD;
 		st->iolen=0;
 		/* st->event=QEV_READ; */
-		/* fall through */
+		return -1; /* don't fall through */
 	case QS_TCPREAD:
-	        if(st->iolen==0) {
+		if(st->iolen==0) {
 			uint16_t recvl_net;
 			rv=read(st->sock,&recvl_net,sizeof(recvl_net));
 			if(rv==-1 && errno==EWOULDBLOCK)
@@ -2149,45 +2150,7 @@ static int p_recursive_query(query_stat_array q, const unsigned char *name, int 
 					DEBUG_PDNSDA_MSG("Sending query to %s\n", PDNSDA2STR(PDNSD_A(qs)));
 				retryquery:
 					rv=p_exec_query(&ent, name, thint, qs,&ns,c_soa);
-					if (rv==RC_OK) {
-						int authok;
-						DEBUG_PDNSDA_MSG("Query to %s succeeded.\n", PDNSDA2STR(PDNSD_A(qs)));
-						if((authok=auth_ok(q, name, thint, ent, hops, qslist, qhlist, qs, ns, &serv))) {
-							if(authok>=0) {
-								if(!qs->failed
-#if !defined(NO_TCP_QUERIES) && !defined(NO_UDP_QUERIES)
-								   && !(qs->qm==UDP_TCP && qs->tc)
-#endif
-								  )
-								{
-									qse=qs;
-									mc=i; /* No need to cancel queries beyond i */
-									goto done;
-								}
-							}
-							else {
-								mc=i; /* No need to cancel queries beyond i */
-								goto free_ent_return_failed;
-							}
-						}
-						/* We do not have a satisfactory answer.
-						   However, we will save a copy in case none of the other
-						   servers in the q list give a satisfactory answer either.
-						 */
-						save_query_result(ent,qs,ns,serv,authok);
-#if !defined(NO_TCP_QUERIES) && !defined(NO_UDP_QUERIES)
-						if(qs->qm==UDP_TCP && qs->tc) {
-							switch_to_tcp(qs);
-							DEBUG_PDNSDA_MSG("Reply from %s was truncated. Trying again using TCP.\n",
-									 PDNSDA2STR(PDNSD_A(qs)));
-							goto retryquery;
-						}
-#endif
-					}
-					else if (rv==RC_NAMEERR || rv==RC_FATALERR) {
-						mc=i; /* No need to cancel queries beyond i */
-						goto done;
-					}
+					assert(rv == -1);
 				}
 				if (qs->state==QS_DONE && i==dc)
 					dc++;
@@ -2321,25 +2284,8 @@ static int p_recursive_query(query_stat_array q, const unsigned char *name, int 
 										 PDNSDA2STR(PDNSD_A(qs)));
 
 								rv=p_exec_query(&ent, name, thint, qs,&ns,c_soa);
+								assert(rv == -1);
 								/* In the unlikely case of immediate success */
-								if (rv==RC_OK) {
-									int authok;
-									DEBUG_PDNSDA_MSG("Query to %s succeeded.\n", PDNSDA2STR(PDNSD_A(qs)));
-									if((authok=auth_ok(q, name, thint, ent, hops, qslist, qhlist, qs, ns, &serv))) {
-										if(authok>=0) {
-											if(!qs->failed) {
-												qse=qs;
-												goto done;
-											}
-										}
-										else
-											goto free_ent_return_failed;
-									}
-									save_query_result(ent,qs,ns,serv,authok);
-								}
-								else if (rv==RC_NAMEERR || rv==RC_FATALERR) {
-									goto done;
-								}
 								++nevents;
 							}
 #endif
