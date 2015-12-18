@@ -71,6 +71,7 @@
 #define MEM_MAX_ERRS 10
 #define THRD_MAX_ERRS 10
 #define MISC_MAX_ERRS 10
+#define TCP_BACKLOG 5
 static volatile unsigned long da_tcp_errs=0;
 static volatile unsigned long da_udp_errs=0;
 static volatile unsigned long da_mem_errs=0;
@@ -1945,28 +1946,30 @@ static void *tcp_answer_thread(struct tcp_answer_task *task)
 
 		olen = 0;
 		while (olen < rlen) {
-            yield(task, EVENT_READ, );
-            {
-                rc = read(sock, buf + olen, rlen - olen);
-                if (rc<=0) {
-                    DEBUG_MSG("Error while reading from TCP client: %s\n",rc==-1?strerror(errno):"incomplete data");
-                    /*
-                     * If the promised length was not sent, we should return an error message,
-                     * but if read fails that way, it is unlikely that it will arrive. Nevertheless...
-                     */
-                    if (olen>=2) { /* We need the id to send a valid reply. */
-                        dns_msg_t err_replay;
-                        mk_error_reply(((dns_hdr_t*)buf)->id,
-                                   olen>=3?((dns_hdr_t*)buf)->opcode:OP_QUERY,
-                                   RC_FORMAT,
-                                   &err_replay.hdr);
-                        err_replay.len=htons(sizeof(dns_hdr_t));
-                        write_all(sock,&err_replay,sizeof(err_replay)); /* error anyway. */
-                    }
-                    goto fail; /* buf freed and socket closed by cleanup handlers */
-                }
-                olen += rc;
-            }
+			rc = read(sock, buf + olen, rlen - olen);
+			if (rc<=0) {
+				if (errno == EAGAIN || errno == EWOULDBLOCK) {
+					yield(task, EVENT_READ, );
+				} else {
+					DEBUG_MSG("Error while reading from TCP client: %s\n",rc==-1?strerror(errno):"incomplete data");
+					/*
+					 * If the promised length was not sent, we should return an error message,
+					 * but if read fails that way, it is unlikely that it will arrive. Nevertheless...
+					 */
+					if (olen>=2) { /* We need the id to send a valid reply. */
+						dns_msg_t err_replay;
+						mk_error_reply(((dns_hdr_t*)buf)->id,
+								   olen>=3?((dns_hdr_t*)buf)->opcode:OP_QUERY,
+								   RC_FORMAT,
+								   &err_replay.hdr);
+						err_replay.len=htons(sizeof(dns_hdr_t));
+						write(sock,&err_replay,sizeof(err_replay)); /* error anyway. */
+					}
+					goto fail; /* buf freed and socket closed by cleanup handlers */
+				}
+			} else {
+				olen += rc;
+			}
 		}
 		nlen=rlen;
 		if (!(resp=process_query(buf,&nlen,NULL,NULL))) {
@@ -2102,7 +2105,7 @@ int init_tcp_socket()
 		return -1;
 	}
 
-	if (listen(sock, 5)) {
+	if (listen(sock, TCP_BACKLOG)) {
 		log_error("Could not listen on tcp socket: %s",strerror(errno));
 		close(sock);
 		return -1;
@@ -2123,6 +2126,7 @@ void *tcp_server_thread(void *p)
 	int sock;
 	pthread_t pt;
 	int csock;
+	int backlog = TCP_BACKLOG;
 
 	/* (void)p; */  /* To inhibit "unused variable" warning */
 
@@ -2136,9 +2140,11 @@ void *tcp_server_thread(void *p)
 
 	sock=tcp_socket;
 
-	/*while (1)*/ {
+	while (backlog-- > 0) {
 		if ((csock=accept(sock,NULL,0))==-1) {
-			if (errno!=EINTR && ++da_tcp_errs<=TCP_MAX_ERRS) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				return;
+			} else if (errno!=EINTR && ++da_tcp_errs<=TCP_MAX_ERRS) {
 				log_error("tcp accept failed: %s",strerror(errno));
 			}
 		} else {
