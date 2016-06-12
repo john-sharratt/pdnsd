@@ -1118,6 +1118,78 @@ static time_t soa_minimum(rr_bucket_t *rrs)
 	return minimum;
 }
 
+int check_reject(query_stat_t *st, dns_cent_array *secs)
+{
+	/* Check whether the answer contains an IP address that should be rejected. */
+	if(have_rejectlist(st)) {
+		int i;
+		int na4=nreject_a4(st);
+		addr4maskpair_t *a4arr=rejectlist_a4(st);
+#if ALLOW_LOCAL_AAAA
+		int na6=nreject_a6(st);
+		addr6maskpair_t *a6arr=rejectlist_a6(st);
+#endif
+		/* Check addresses in the answer, authority and additional sections. */
+		for(i=0;i<3;++i) {
+			dns_cent_array sec=secs[i];
+			int j,nce=DA_NEL(sec);
+			for(j=0;j<nce;++j) {
+				dns_cent_t *cent=&DA_INDEX(sec,j);
+				rr_set_t *rrset=getrrset_A(cent);
+				if(rrset && na4) {
+					/* This is far from the world's most efficient matching algorithm,
+					   but it should work OK as long as the numbers involved are small.
+					*/
+					rr_bucket_t *rr;
+					for(rr=rrset->rrs; rr; rr=rr->next) {
+						struct in_addr *a=(struct in_addr *)(rr->data);
+						int k;
+						for(k=0;k<na4;++k) {
+							addr4maskpair_t *am = &a4arr[k];
+							if(ADDR4MASK_EQUIV(a,&am->a,&am->mask)) {
+#if DEBUG>0
+								unsigned char nmbuf[DNSNAMEBUFSIZE]; char abuf[ADDRSTR_MAXLEN];
+								DEBUG_PDNSDA_MSG("Rejecting answer from server %s because it contains an A record"
+										 " for \"%s\" with an address in the reject list: %s\n",
+										 PDNSDA2STR(PDNSD_A(st)),
+										 rhn2str(cent->qname,nmbuf,sizeof(nmbuf)),
+										 inet_ntop(AF_INET,a,abuf,sizeof(abuf)));
+#endif
+								return 1;
+							}
+						}
+					}
+				}
+#if ALLOW_LOCAL_AAAA
+				rrset=getrrset_AAAA(cent);
+				if(rrset && na6) {
+					rr_bucket_t *rr;
+					for(rr=rrset->rrs; rr; rr=rr->next) {
+						struct in6_addr *a=(struct in6_addr *)(rr->data);
+						int k;
+						for(k=0;k<na6;++k) {
+							addr6maskpair_t *am = &a6arr[k];
+							if(ADDR6MASK_EQUIV(a,&am->a,&am->mask)) {
+#if DEBUG>0
+								unsigned char nmbuf[DNSNAMEBUFSIZE]; char abuf[INET6_ADDRSTRLEN];
+								DEBUG_PDNSDA_MSG("Rejecting answer from server %s because it contains an AAAA record"
+										 " for \"%s\" with an address in the reject list: %s\n",
+										 PDNSDA2STR(PDNSD_A(st)),
+										 rhn2str(cent->qname,nmbuf,sizeof(nmbuf)),
+										 inet_ntop(AF_INET6,a,abuf,sizeof(abuf)));
+#endif
+								return 1;
+							}
+						}
+					}
+				}
+#endif
+			}
+		}
+	}
+	return 0;
+}
+
 /*
  * The function that will actually execute a query. It takes a state structure in st.
  * st->state must be set to QS_INITIAL before calling.
@@ -1543,74 +1615,7 @@ static int p_exec_query(dns_cent_t **entp, const unsigned char *name, int thint,
 			}
 		}
 
-		/* Check whether the answer contains an IP address that should be rejected. */
-		if(have_rejectlist(st)) {
-			int i;
-			int na4=nreject_a4(st);
-			addr4maskpair_t *a4arr=rejectlist_a4(st);
-#if ALLOW_LOCAL_AAAA
-			int na6=nreject_a6(st);
-			addr6maskpair_t *a6arr=rejectlist_a6(st);
-#endif
-			/* Check addresses in the answer, authority and additional sections. */
-			for(i=0;i<3;++i) {
-				dns_cent_array sec=secs[i];
-				int j,nce=DA_NEL(sec);
-				for(j=0;j<nce;++j) {
-					dns_cent_t *cent=&DA_INDEX(sec,j);
-					rr_set_t *rrset=getrrset_A(cent);
-					if(rrset && na4) {
-						/* This is far from the world's most efficient matching algorithm,
-						   but it should work OK as long as the numbers involved are small.
-						*/
-						rr_bucket_t *rr;
-						for(rr=rrset->rrs; rr; rr=rr->next) {
-							struct in_addr *a=(struct in_addr *)(rr->data);
-							int k;
-							for(k=0;k<na4;++k) {
-								addr4maskpair_t *am = &a4arr[k];
-								if(ADDR4MASK_EQUIV(a,&am->a,&am->mask)) {
-#if DEBUG>0
-									unsigned char nmbuf[DNSNAMEBUFSIZE]; char abuf[ADDRSTR_MAXLEN];
-									DEBUG_PDNSDA_MSG("Rejecting answer from server %s because it contains an A record"
-											 " for \"%s\" with an address in the reject list: %s\n",
-											 PDNSDA2STR(PDNSD_A(st)),
-											 rhn2str(cent->qname,nmbuf,sizeof(nmbuf)),
-											 inet_ntop(AF_INET,a,abuf,sizeof(abuf)));
-#endif
-									reject_ans=1; goto rejectlist_scan_done;
-								}
-							}
-						}
-					}
-#if ALLOW_LOCAL_AAAA
-					rrset=getrrset_AAAA(cent);
-					if(rrset && na6) {
-						rr_bucket_t *rr;
-						for(rr=rrset->rrs; rr; rr=rr->next) {
-							struct in6_addr *a=(struct in6_addr *)(rr->data);
-							int k;
-							for(k=0;k<na6;++k) {
-								addr6maskpair_t *am = &a6arr[k];
-								if(ADDR6MASK_EQUIV(a,&am->a,&am->mask)) {
-#if DEBUG>0
-									unsigned char nmbuf[DNSNAMEBUFSIZE]; char abuf[INET6_ADDRSTRLEN];
-									DEBUG_PDNSDA_MSG("Rejecting answer from server %s because it contains an AAAA record"
-											 " for \"%s\" with an address in the reject list: %s\n",
-											 PDNSDA2STR(PDNSD_A(st)),
-											 rhn2str(cent->qname,nmbuf,sizeof(nmbuf)),
-											 inet_ntop(AF_INET6,a,abuf,sizeof(abuf)));
-#endif
-									reject_ans=1; goto rejectlist_scan_done;
-								}
-							}
-						}
-					}
-#endif
-				}
-			}
-		rejectlist_scan_done:;
-		}
+		reject_ans = check_reject(st, secs);
 
 		/* negative caching for domains */
 		if (rcode==RC_NAMEERR) {
@@ -2767,8 +2772,8 @@ static int auth_ok(query_stat_array q, const unsigned char *name, int thint, dns
 				pdnsd_a2 *pserva= &serva[ia];
 				int i;
 
-				if(is_local_addr(PDNSD_A2_TO_A(pserva)))
-					continue;  /* Do not use local address (as defined in netdev.c). */
+				//if(is_local_addr(PDNSD_A2_TO_A(pserva)))
+				//	continue;  /* Do not use local address (as defined in netdev.c). */
 
 				/* Skip duplicate addresses. */
 				for (i=0; i<n; ++i) {
