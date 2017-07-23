@@ -1264,8 +1264,8 @@ static int p_exec_query(dns_cent_t **entp, const unsigned char *name, int thint,
 			sched_server_test(PDNSD_A(st),1,1);
 			st->needs_testing=0;
 		}
-
-		rv=rcode;
+                
+                rv=rcode;
 		if(rcode==RC_OK || rcode==RC_NAMEERR) {
 			/* success or at least no requery is needed */
 			st->state=QS_DONE;
@@ -1415,12 +1415,11 @@ static int p_exec_query(dns_cent_t **entp, const unsigned char *name, int thint,
 		st->aa= (st->recvbuf->aa && !st->failed);
 		st->tc= st->recvbuf->tc;
 		st->ra= (rd && st->recvbuf->ra);
-
-		/* Don't flag cache entries from a truncated reply as authoritative. */
+                
+                /* Don't flag cache entries from a truncated reply as authoritative. */
 		aa= (st->aa && !st->tc);
 		flags=st->flags;
 		if (aa) flags|=CF_AUTH;
-
 
 		/* Initialize a dns_cent_t in the array for the answer section */
 		if (!(ans_sec=DA_GROW1(ans_sec))) {
@@ -1428,7 +1427,7 @@ static int p_exec_query(dns_cent_t **entp, const unsigned char *name, int thint,
 			goto free_recvbuf_return;
 		}
 		/* By marking DF_AUTH, we mean authoritative AND complete. */
-		if (!init_cent(&DA_INDEX(ans_sec,0), name, 0, 0, (aa && qtype==QT_ALL)?DF_AUTH:0  DBG1)) {
+		if (!init_cent(&DA_INDEX(ans_sec,0), name, 0, 0, (aa)?DF_AUTH:0  DBG1)) {
 			rv=RC_FATALERR; /* unrecoverable error */
 			goto free_centarrays_recvbuf_return;
 		}
@@ -3363,6 +3362,9 @@ static void set_all_flags_ttl(unsigned short *flags, time_t *ttl, dns_cent_t *ca
 static int lookup_cache_status(const unsigned char *name, int thint, dns_cent_t **cachedp, unsigned short *flagsp,
 			       time_t queryts, unsigned char *c_soa)
 {
+    return RC_NOTCACHED;
+    
+    /*
 	dns_cent_t *cached;
 	int rc=RC_NOTCACHED;
 	int wild=0;
@@ -3457,6 +3459,7 @@ static int lookup_cache_status(const unsigned char *name, int thint, dns_cent_t 
 return_rc:
 	if(flagsp) *flagsp=flags;
 	return rc;
+    */
 }
 
 

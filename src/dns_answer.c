@@ -863,7 +863,8 @@ static dns_msg_t *compose_answer(llist *ql, dns_hdr_t *hdr, size_t *rlen, edns_i
 				}
 				goto cleanup_return;
 			}
-			if(!(cached->flags&DF_LOCAL))
+			if(!(cached->flags&DF_LOCAL) &&
+                           !(cached->flags&DF_AUTH))
 				aa=0;
 
 			if (!add_to_response(&ans,rlen,&allocsz,qname,qe->qtype,queryts,cached,udp,&cb,&sva,&ar))

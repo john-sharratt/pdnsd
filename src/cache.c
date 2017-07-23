@@ -559,8 +559,8 @@ int init_cent(dns_cent_t *cent, const unsigned char *qname, time_t ttl, time_t t
 {
 	int i;
 	size_t namesz=rhnlen(qname);
-
-	cent->qname=cache_malloc(namesz);
+        
+        cent->qname=cache_malloc(namesz);
 	if (cent->qname == NULL)
 		return 0;
 	memcpy(cent->qname,qname,namesz);
